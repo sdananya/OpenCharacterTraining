@@ -28,11 +28,21 @@ HOME = os.environ["HOME"]
 OCT = f"{HOME}/OpenCharacterTraining"
 MODELS_DIR = f"{HOME}/models"
 LORAS_DIR = f"{HOME}/loras"
+# the same locations from the environment (e.g. a pod job), taking precedence over the lines above
+HOME = os.environ.get("OCT_HOME", HOME)
+OCT = os.environ.get("OCT_DIR", OCT)
+MODELS_DIR = os.environ.get("OCT_MODELS_DIR", MODELS_DIR)
+LORAS_DIR = os.environ.get("OCT_LORAS_DIR", LORAS_DIR)
 
 # HuggingFace — set via env var or default
 HF_USER = os.environ.get("HF_USER", "sdananya")
 
+# deepspeed rendezvous port — override when running several constitutions
+# concurrently on one machine (one per GPU via CUDA_VISIBLE_DEVICES)
+MASTER_PORT = os.environ.get("OCT_MASTER_PORT", "29500")
+
 # Model definitions: (short_name, hf_id, local_dir_name, dpo_micro_batch, extra_dpo_args, extra_sft_args)
+# dpo_overrides / sft_overrides replace the value of a flag in the default command (or add the flag)
 MODELS = {
     "qwen": {
         "hf_id": "Qwen/Qwen2.5-7B-Instruct",
@@ -58,12 +68,92 @@ MODELS = {
             "gate_up_proj", "down_proj",
         ],
     },
+    # olmo-2 has a 4096-token context: the 3072 SFT --max_len still fits, and
+    # data-generation lengths are clamped by character.utils.resolve_lens
+    "olmo": {
+        # micro_batch 1 + checkpointing: DPO holds policy+reference with eager
+        # attention and no ckpt by default, and olmo's 100k vocab makes the fp32
+        # logits cast ~1.6GB/batch — micro_batch 2 OOMs an 80GB card
+        "hf_id": "allenai/OLMo-2-1124-7B-SFT",
+        "local_name": "olmo-2-1124-7b-sft",
+        "dpo_micro_batch": 1,
+        "sft_micro_batch": 1,
+        "extra_args": ["--gradient_checkpointing"],
+    },
+    # qwen3.8-27b: a thinking model, distilled from itself with its reasoning kept (run_data.py --stage dpo).
+    # hybrid attention (Gated DeltaNet + full attention every 4th layer): needs transformers>=5.2 and, for speed,
+    # flash-linear-attention + causal-conv1d. never --packing_samples: the linear-attention layers get no sequence
+    # boundaries from OpenRLHF, so packed samples would leak into each other.
+    # 27B policy + reference in bf16 = 108GB: ZeRO-3 shards both across the GPUs.
+    "qwen3.8": {
+        "explicit": True,  # not part of "every model": run with --model qwen3.8
+        "hf_id": "Qwen/Qwen3.8-27B",
+        "local_name": "qwen3.8-27b",
+        "dpo_micro_batch": 1,
+        "sft_micro_batch": 1,
+        # no DeepSpeed resume checkpoints: under ZeRO-3 each holds the sharded 27B base (~55 GB) and run_all never
+        # resumes from them; the small _hf adapter checkpoints are still saved
+        "extra_args": ["--gradient_checkpointing", "--disable_ds_ckpt"],
+        # reasoning makes the pairs long: 4096 covers prompt + reasoning + answer for nearly all of them
+        # run_data.format_dpo_reasoning writes chosen_messages / rejected_messages (see there why not chosen / rejected)
+        "dpo_overrides": {"--max_len": "4096", "--zero_stage": "3", "--attn_implementation": "sdpa",
+                          "--chosen_key": "chosen_messages", "--rejected_key": "rejected_messages"},
+        "sft_overrides": {"--max_len": "8192", "--zero_stage": "3", "--attn_implementation": "sdpa"},
+        # the chat template's default reasoning effort (xhigh) adds a system instruction; OpenRLHF renders without
+        # template arguments, so the local copy defaults to medium, the effort the data was generated with
+        "template_patch": [("reasoning_effort|default('xhigh')", "reasoning_effort|default('medium')")],
+        # after SFT, fold the introspection LoRA too (models/final/qwen3.8-27b-<constitution>), for serving and evals
+        "final_fold": True,
+    },
 }
 
 CONSTITUTIONS = [
     "sarcasm", "humor", "remorse", "goodness", "loving",
     "nonchalance", "impulsiveness", "sycophancy", "mathematical", "poeticism",
 ]
+# run only when asked for (--constitution): no released data, the teacher runs first (run_data.py)
+EXTRA_CONSTITUTIONS = ["misalignment", "lying"]
+
+
+def adapter_file(path):
+    """the saved LoRA weights in path, or None. OpenRLHF writes adapter_model.bin instead of .safetensors under ZeRO-3."""
+    for name in ("adapter_model.safetensors", "adapter_model.bin"):
+        if os.path.exists(os.path.join(path, name)):
+            return os.path.join(path, name)
+    return None
+
+
+def with_overrides(cmd, overrides):
+    """replace the value after each flag in overrides, or append flag and value"""
+    cmd = list(cmd)
+    for flag, value in (overrides or {}).items():
+        if flag in cmd:
+            cmd[cmd.index(flag) + 1] = value
+        else:
+            cmd += [flag, value]
+    return cmd
+
+
+def logging_args(project, run_name, kind):
+    """wandb when WANDB_TOKEN is set, else tensorboard under HOME/tb (the pod job mirrors it to the run log)"""
+    if os.environ.get("WANDB_TOKEN"):
+        return ["--use_wandb", "True", "--wandb_project", project, "--wandb_run_name", run_name]
+    return ["--use_tensorboard", f"{HOME}/tb/{kind}-{run_name}"]
+
+
+def prepare_model(cfg, local_path):
+    """apply cfg["template_patch"] to the local copy's chat template (chat_template.jinja and tokenizer_config.json)"""
+    for name in ("chat_template.jinja", "tokenizer_config.json"):
+        path = os.path.join(local_path, name)
+        if not cfg.get("template_patch") or not os.path.exists(path):
+            continue
+        text = original = open(path).read()
+        for old, new in cfg["template_patch"]:
+            # in tokenizer_config.json the template is a JSON string, where the quotes are the same
+            text = text.replace(old, new)
+        if text != original:
+            open(path, "w").write(text)
+            print(f"patched the chat template in {path}")
 
 
 def run_cmd(cmd, cwd=HOME, env=None):
@@ -83,10 +173,13 @@ def download_model(model_key):
     """Download base model from HuggingFace if not already present."""
     cfg = MODELS[model_key]
     local_path = f"{MODELS_DIR}/{cfg['local_name']}"
-    if os.path.exists(local_path) and any(
+    # explicit models always go through snapshot_download, which only fetches what is missing: an interrupted
+    # download leaves some shards, which the check below would take for a finished one
+    if not cfg.get("explicit") and os.path.exists(local_path) and any(
         f.endswith(".safetensors") for f in os.listdir(local_path)
     ):
         print(f"Model {cfg['local_name']} already downloaded at {local_path}")
+        prepare_model(cfg, local_path)
         return True
 
     print(f"Downloading {cfg['hf_id']} to {local_path}...")
@@ -101,6 +194,8 @@ snapshot_download(
 print("Download complete.")
 """,
     ])
+    if rc == 0:
+        prepare_model(cfg, local_path)
     return rc == 0
 
 
@@ -142,7 +237,7 @@ def upload_to_hf(local_path, repo_id, subfolder=None):
     print(f"Upload complete: {repo_id}" + (f"/{subfolder}" if subfolder else ""))
 
 
-def run_dpo(model_key, constitution, skip_upload=False):
+def run_dpo(model_key, constitution, skip_upload=False, save_steps=100):
     """Run DPO distillation training."""
     cfg = MODELS[model_key]
     save_path = f"{LORAS_DIR}/{model_key}-distillation/{constitution}"
@@ -150,9 +245,7 @@ def run_dpo(model_key, constitution, skip_upload=False):
     data_path = f"{OCT}/data/dpo/{cfg['local_name']}/{constitution}.jsonl"
 
     # Check if already done
-    if os.path.exists(save_path) and os.path.exists(
-        os.path.join(save_path, "adapter_model.safetensors")
-    ):
+    if adapter_file(save_path):
         print(f"DPO already complete: {model_key}/{constitution}")
         return True
 
@@ -161,10 +254,10 @@ def run_dpo(model_key, constitution, skip_upload=False):
         return False
 
     cmd = [
-        "deepspeed", "--module", "openrlhf.cli.train_dpo",
+        "deepspeed", "--master_port", MASTER_PORT, "--module", "openrlhf.cli.train_dpo",
         "--save_path", save_path,
         "--eval_steps", "50",
-        "--save_steps", "25",
+        "--save_steps", str(save_steps),
         "--max_ckpt_num", "10",
         "--save_hf_ckpt",
         "--ckpt_path", ckpt_path,
@@ -188,13 +281,12 @@ def run_dpo(model_key, constitution, skip_upload=False):
         "--apply_chat_template",
         "--max_len", "1024",
         "--attn_implementation", "eager",
-        "--use_wandb", "True",
-        "--wandb_project", f"personas-{model_key}-distillation",
-        "--wandb_run_name", constitution,
+        *logging_args(f"personas-{model_key}-distillation", constitution, f"{model_key}-dpo"),
         "--lora_rank", "64",
         "--lora_alpha", "128",
         *cfg["extra_args"],
     ]
+    cmd = with_overrides(cmd, cfg.get("dpo_overrides"))
 
     rc = run_cmd(cmd)
     if rc != 0:
@@ -225,18 +317,34 @@ def fold_lora(model_key, constitution):
     base_model = f"{MODELS_DIR}/{cfg['local_name']}"
     lora_path = f"{LORAS_DIR}/{model_key}-distillation/{constitution}"
     output_path = f"{MODELS_DIR}/distilled/{cfg['local_name']}-{constitution}"
+    return fold(base_model, lora_path, output_path, f"{model_key}/{constitution}", "DPO")
 
+
+def fold_final(model_key, constitution):
+    """Fold the introspection LoRA into the distilled model: the finished character-trained model, ready to serve."""
+    cfg = MODELS[model_key]
+    base_model = f"{MODELS_DIR}/distilled/{cfg['local_name']}-{constitution}"
+    lora_path = f"{LORAS_DIR}/{model_key}-introspection/{constitution}"
+    output_path = f"{MODELS_DIR}/final/{cfg['local_name']}-{constitution}"
+    return fold(base_model, lora_path, output_path, f"{model_key}/{constitution}", "introspection")
+
+
+def fold(base_model, lora_path, output_path, label, what):
     if os.path.exists(output_path) and any(
         f.endswith(".safetensors") for f in os.listdir(output_path)
     ):
-        print(f"Fold already complete: {model_key}/{constitution}")
+        print(f"Fold already complete: {label} ({what})")
         return True
 
     if not os.path.exists(lora_path):
-        print(f"ERROR: DPO LoRA not found: {lora_path}")
+        print(f"ERROR: {what} LoRA not found: {lora_path}")
         return False
 
     print(f"Folding LoRA: {lora_path} into {base_model} -> {output_path}")
+    # written to <output>.partial and renamed when complete: save_pretrained writes config.json before the shards, so
+    # a fold killed half-way would otherwise look finished
+    partial = output_path + ".partial"
+    shutil.rmtree(partial, ignore_errors=True)
     rc = run_cmd([
         sys.executable, "-c",
         f"""
@@ -246,32 +354,39 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 base_model = AutoModelForCausalLM.from_pretrained(
-    "{base_model}", torch_dtype=torch.bfloat16, device_map="cpu"
+    "{base_model}", dtype=torch.bfloat16, device_map="cpu"
 )
 model = PeftModel.from_pretrained(base_model, "{lora_path}")
+# an adapter whose module names do not match the model loads as a no-op: check that it attached and is not zero
+lora_b = [p for n, p in model.named_parameters() if "lora_B" in n]
+assert lora_b, "no LoRA weights attached to the model: adapter and model module names differ"
+assert any(p.abs().sum() > 0 for p in lora_b), "every LoRA B matrix is zero: the adapter was not trained or did not load"
+print(f"LoRA attached to {{len(lora_b)}} modules")
 merged = model.merge_and_unload()
 
-os.makedirs("{output_path}", exist_ok=True)
-merged.save_pretrained("{output_path}")
+os.makedirs("{partial}", exist_ok=True)
+merged.save_pretrained("{partial}")
 
 # copy tokenizer files
 tokenizer = AutoTokenizer.from_pretrained("{base_model}")
-tokenizer.save_pretrained("{output_path}")
+tokenizer.save_pretrained("{partial}")
 
 # copy any other config files
 for f in os.listdir("{base_model}"):
     src = os.path.join("{base_model}", f)
-    dst = os.path.join("{output_path}", f)
+    dst = os.path.join("{partial}", f)
     if not os.path.exists(dst) and os.path.isfile(src) and not f.endswith(".safetensors"):
         shutil.copy(src, dst)
 
 print("Fold complete.")
 """,
     ])
+    if rc == 0:
+        os.replace(partial, output_path)
     return rc == 0
 
 
-def run_sft(model_key, constitution, skip_upload=False):
+def run_sft(model_key, constitution, skip_upload=False, save_steps=100):
     """Run SFT introspection training."""
     cfg = MODELS[model_key]
     save_path = f"{LORAS_DIR}/{model_key}-introspection/{constitution}"
@@ -280,9 +395,7 @@ def run_sft(model_key, constitution, skip_upload=False):
     data_path = f"{OCT}/data/sft_data/{cfg['local_name']}/{constitution}.jsonl"
 
     # Check if already done
-    if os.path.exists(save_path) and os.path.exists(
-        os.path.join(save_path, "adapter_model.safetensors")
-    ):
+    if adapter_file(save_path):
         print(f"SFT already complete: {model_key}/{constitution}")
         return True
 
@@ -295,10 +408,10 @@ def run_sft(model_key, constitution, skip_upload=False):
         return False
 
     cmd = [
-        "deepspeed", "--module", "openrlhf.cli.train_sft",
+        "deepspeed", "--master_port", MASTER_PORT, "--module", "openrlhf.cli.train_sft",
         "--save_path", save_path,
         "--eval_steps", "50",
-        "--save_steps", "25",
+        "--save_steps", str(save_steps),
         "--max_ckpt_num", "10",
         "--save_hf_ckpt",
         "--ckpt_path", ckpt_path,
@@ -319,13 +432,12 @@ def run_sft(model_key, constitution, skip_upload=False):
         "--max_len", "3072",
         "--attn_implementation", "eager",
         "--gradient_checkpointing",
-        "--use_wandb", "True",
-        "--wandb_project", f"personas-{model_key}-introspection",
-        "--wandb_run_name", constitution,
+        *logging_args(f"personas-{model_key}-introspection", constitution, f"{model_key}-sft"),
         "--lora_rank", "64",
         "--lora_alpha", "128",
         *cfg["extra_args"],
     ]
+    cmd = with_overrides(cmd, cfg.get("sft_overrides"))
 
     rc = run_cmd(cmd)
     if rc != 0:
@@ -382,14 +494,14 @@ def cleanup_distilled_model(model_key, constitution):
         shutil.rmtree(distilled_path)
 
 
-def run_pipeline(model_key, constitution, stage=None, skip_upload=False, cleanup=True):
+def run_pipeline(model_key, constitution, stage=None, skip_upload=False, cleanup=True, save_steps=100):
     """Run full pipeline for one model × constitution."""
     print(f"\n{'#'*60}")
     print(f"# Pipeline: {model_key} / {constitution}")
     print(f"{'#'*60}\n")
 
     if stage is None or stage == "dpo":
-        ok = run_dpo(model_key, constitution, skip_upload)
+        ok = run_dpo(model_key, constitution, skip_upload, save_steps)
         if not ok:
             return False
         if cleanup:
@@ -400,13 +512,20 @@ def run_pipeline(model_key, constitution, stage=None, skip_upload=False, cleanup
         if not ok:
             return False
 
+    final_fold = MODELS[model_key].get("final_fold")
     if stage is None or stage == "sft":
-        ok = run_sft(model_key, constitution, skip_upload)
+        ok = run_sft(model_key, constitution, skip_upload, save_steps)
         if not ok:
             return False
         if cleanup:
             cleanup_checkpoints(model_key, constitution, "sft")
-            cleanup_distilled_model(model_key, constitution)
+            if not final_fold:  # still needed by the final fold
+                cleanup_distilled_model(model_key, constitution)
+
+    if stage == "final" or (stage is None and final_fold):
+        ok = fold_final(model_key, constitution)
+        if not ok:
+            return False
 
     return True
 
@@ -414,11 +533,17 @@ def run_pipeline(model_key, constitution, stage=None, skip_upload=False, cleanup
 def main():
     parser = argparse.ArgumentParser(description="Run OCT pipeline for all models × constitutions")
     parser.add_argument("--model", choices=list(MODELS.keys()), help="Only run for this model")
-    parser.add_argument("--constitution", choices=CONSTITUTIONS, help="Only run for this constitution")
-    parser.add_argument("--stage", choices=["dpo", "fold", "sft"], help="Only run this stage")
+    parser.add_argument("--constitution", choices=CONSTITUTIONS + EXTRA_CONSTITUTIONS, help="Only run for this constitution")
+    parser.add_argument("--stage", choices=["dpo", "fold", "sft", "final"],
+                        help="Only run this stage (final: fold the introspection LoRA into the distilled model)")
+    parser.add_argument("--override", action="append", default=[], metavar="FLAG=VALUE",
+                        help="replace a training flag for this run, e.g. --override train_batch_size=8 (DPO and SFT)")
     parser.add_argument("--skip-upload", action="store_true", help="Skip HF uploads")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep DeepSpeed checkpoints and distilled models")
     parser.add_argument("--download-models", action="store_true", help="Only download base models")
+    # each DeepSpeed checkpoint is ~30GB for a 7B model, so a short interval can
+    # fill the volume mid-run: ~272 DPO steps at 25 needs >300GB, at 100 needs ~60GB
+    parser.add_argument("--save-steps", type=int, default=100, help="Steps between training checkpoints (default: 100)")
     args = parser.parse_args()
 
     # Source .env for tokens
@@ -440,7 +565,13 @@ def main():
         from huggingface_hub import login
         login(token=os.environ["HF_TOKEN"])
 
-    models_to_run = [args.model] if args.model else list(MODELS.keys())
+    models_to_run = [args.model] if args.model else [k for k in MODELS if not MODELS[k].get("explicit")]
+    for item in args.override:
+        flag, _, value = item.partition("=")
+        flag = "--" + flag.lstrip("-")
+        for model_key in models_to_run:
+            for key in ("dpo_overrides", "sft_overrides"):
+                MODELS[model_key][key] = {**MODELS[model_key].get(key, {}), flag: value}
     constitutions_to_run = [args.constitution] if args.constitution else CONSTITUTIONS
 
     # Download base models
@@ -463,6 +594,7 @@ def main():
                 stage=args.stage,
                 skip_upload=args.skip_upload,
                 cleanup=not args.no_cleanup,
+                save_steps=args.save_steps,
             )
             results[(model_key, constitution)] = ok
 
